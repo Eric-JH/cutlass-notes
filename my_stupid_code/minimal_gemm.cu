@@ -4,26 +4,6 @@
 #include <torch/extension.h>
 #include <torch/types.h>
 
-namespace spec{
-using namespace cute;
-
-template <typename T_, int kTileM_ = 16, int kTileN_ = 8, int kTileK_ = 8>
-struct KernelSpec
-{
-  using T = T_;
-
-  static constexpr int kTileM = kTileM_;
-  static constexpr int kTileN = kTileN_;
-  static constexpr int kTileK = kTileK_;
-
-  using MMA_op = SM80_16x8x8_F16F16F16F16_TN;
-  using TiledMMA = decltype(make_tile_mma(MMA_op));
-
-  static constexpr kThreadNum = size(TiledMMA{});
-  static constexpr kShmSize = 0;
-};
-}
-
 template<typename Spec, bool IsGemm>
 __global__ void minimal_gemm(void *Cptr, const void *Aptr, const void *Bptr, int m, int n, int k){
     using namespace cute;
@@ -38,11 +18,11 @@ __global__ void minimal_gemm(void *Cptr, const void *Aptr, const void *Bptr, int
 
     int tid = threadIdx.x;
 
-    Tensor mA = make_tensor(make_gmem_ptr((T *)Aptr), make_shape(m, k), make_stride(k, _1));
-    Tensor mB = make_tensor(make_gmem_ptr((T *)Bprt), make_shape(n, k), make_stride(k, _1));
-    Tensor mC = make_tensor(make_gmem_ptr((T *)Cptr), make_shape(m, n), make_stride(n, _1));
+    Tensor mA = make_tensor(make_gmem_ptr((T *)Aptr), make_shape(m, k), make_stride(k, Int<1>{}));
+    Tensor mB = make_tensor(make_gmem_ptr((T *)Bptr), make_shape(n, k), make_stride(k, Int<1>{}));
+    Tensor mC = make_tensor(make_gmem_ptr((T *)Cptr), make_shape(m, n), make_stride(n, Int<1>{}));
 
-    auto Tiler = make_tile(Int<kTileM>{}, Int<kTileN>{}, Int<kTileK>{});
+    auto tiler = make_tile(Int<kTileM>{}, Int<kTileN>{}, Int<kTileK>{});
     auto coord = make_coord(0, 0, 0);
 
     Tensor gA = local_tile(mA, tiler, coord, Step<_1, X, _1>{});
@@ -75,12 +55,120 @@ __global__ void minimal_gemm(void *Cptr, const void *Aptr, const void *Bptr, int
     copy(copy_atom, tCrC, tCgC);
 }
 
-#define CHECK_TORCH_TENSOR_DTYPE(T, DTYPE)                                                                            
-  do {                                                                                                                
-    if ((T).options().dtype() != (DTYPE)) {                                                                           
-      std::cerr << "Tensor dtype mismatch! Expected: " << (DTYPE) << ", but got: " << (T).options().dtype() << " at"  
-                << __FILE__ << ": " << __LINE__ << std::endl;                                                         
-      std::exit();
-    }
+namespace spec{
+using namespace cute;
+
+template <typename T_, int kTileM_ = 16, int kTileN_ = 8, int kTileK_ = 8>
+struct KernelSpec
+{
+  using T = T_;
+
+  static constexpr int kTileM = kTileM_;
+  static constexpr int kTileN = kTileN_;
+  static constexpr int kTileK = kTileK_;
+
+  using MMA_op = SM80_16x8x8_F16F16F16F16_TN;
+  using TiledMMA = decltype(make_tiled_mma(MMA_op{}));
+
+  static constexpr int kThreadNum = size(TiledMMA{});
+  static constexpr int kShmSize = 0;
+};
+}
+
+
+#define CHECK_TORCH_TENSOR_DTYPE(T, DTYPE)                                                                            \
+  do {                                                                                                                \
+    if ((T).options().dtype() != (DTYPE)) {                                                                           \
+      std::cerr << "Tensor dtype mismatch! Expected: " << (DTYPE) << ", but got: " << (T).options().dtype() << " at"  \
+                << __FILE__ << ": " << __LINE__ << std::endl;                                                         \
+      std::exit(1);                                                                                                   \
+    }                                                                                                                 \
   } while (0);
 
+#define CHECK_TORCH_TENSOR_SHAPE(T, M, N)                                                                             \
+  do {                                                                                                                \
+    auto actual_shape = (T).sizes();                                                                                  \
+    if (actual_shape != torch::IntArrayRef({M, N})) {                                                                 \
+      std::cerr << "Tensor shape mismatch! Expected: " << torch::IntArrayRef({M, N}) << ", but got: " << actual_shape \
+                << " at " << __FILE__ << ":" << __LINE__ << std::endl;                                                \
+      std::exit(EXIT_FAILURE);                                                                                        \
+    }                                                                                                                 \
+  } while (0);
+
+#define BOOL_SWITCH(COND, CONST_NAME, ...)                                                                            \
+  [&] {                                                                                                               \
+    if (COND) {                                                                                                       \
+      constexpr static bool CONST_NAME = true;                                                                        \
+      return __VA_ARGS__();                                                                                           \
+    } else {                                                                                                          \
+      constexpr static bool CONST_NAME = false;                                                                       \
+      return __VA_ARGS__();                                                                                           \
+    }                                                                                                                 \
+  }()
+
+
+template <typename ComputeType, typename AccType = ComputeType>
+torch::Tensor minimal_gemm(const torch::Tensor &a, const torch::Tensor &b, std::optional<torch::Tensor> &_c) {
+  at::cuda::CUDAGuard device_guard{a.get_device()};
+  auto stream = at::cuda::getCurrentCUDAStream().stream();
+
+  const int M = 16;
+  const int N = 8;
+  const int K = 8;
+
+  auto torch_compute_type = [] {
+    if constexpr (std::is_same_v<ComputeType, cute::half_t>) return torch::kHalf;
+    throw std::runtime_error("Unsupported ComputeType!");
+  }();
+
+  auto torch_acc_type = [] {
+    if constexpr (std::is_same_v<AccType, cute::half_t>) return torch::kHalf;
+    throw std::runtime_error("Unsupported AccType!");
+  }();
+
+  torch::Tensor c;
+  bool is_gemm;
+
+  if (!_c.has_value()) {
+    auto options = torch::TensorOptions().dtype(torch_acc_type).device(torch::kCUDA);
+    c = torch::empty({M, N}, options);
+    is_gemm = true;
+  }
+  else {
+    c = _c.value();
+    is_gemm = false;
+  }
+  
+  CHECK_TORCH_TENSOR_DTYPE(a, torch_compute_type)
+  CHECK_TORCH_TENSOR_DTYPE(b, torch_compute_type)
+  CHECK_TORCH_TENSOR_DTYPE(c, torch_acc_type)
+  
+  CHECK_TORCH_TENSOR_SHAPE(a, M, K)
+  CHECK_TORCH_TENSOR_SHAPE(b, N, K)
+  CHECK_TORCH_TENSOR_SHAPE(c, M, N)
+
+  using Spec = spec::KernelSpec<ComputeType, M, N, K>;
+  
+  dim3 block = Spec::kThreadNum;
+  dim3 grid((N + Spec::kTileN - 1) / Spec::kTileN, (M + Spec::kTileM - 1) / Spec::kTileM);
+  int shm_size = Spec::kShmSize;
+
+  printf("Block Size: (%d, %d, %d) | Grid Size: (%d, %d, %d) | Shared Memory Size: %d Bytes\n", block.x, block.y,
+        block.z, grid.x, grid.y, grid.z, shm_size);
+  
+  cudaDeviceSynchronize();
+
+  BOOL_SWITCH(is_gemm, IsGemm, [&] {
+    minimal_gemm<Spec, IsGemm><<<grid, block, shm_size, stream>>>(
+      reinterpret_cast<AccType *>(c.data_ptr()), reinterpret_cast<ComputeType *>(a.data_ptr()),
+      reinterpret_cast<ComputeType *>(b.data_ptr()), M, N, K
+    );
+  });
+
+  cudaDeviceSynchronize();
+  return c;
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  m.def("minimal_gemm", &(minimal_gemm<cute::half_t>), "Run a single 16x8x8 MMA operation.");
+}
