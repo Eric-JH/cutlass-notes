@@ -34,3 +34,21 @@
     }                                                                                                                 \
   }()
 
+template <typename T> constexpr torch::ScalarType to_torch_scalar_type() {
+  if constexpr (std::is_same_v<T, cute::half_t>)
+    return torch::kHalf;
+  else if constexpr (std::is_same_v<T, cute::bfloat16_t>)
+    return torch::kBFloat16;
+  else if constexpr (std::is_same_v<T, float>)
+    return torch::kFloat32;
+  else if constexpr (std::is_same_v<T, cute::float_e4m3_t>)
+    return torch::kFloat8_e4m3fn;
+  else if constexpr (std::is_same_v<T, cute::float_e5m2_t>)
+    return torch::kFloat8_e5m2;
+  else
+    throw std::runtime_error("Unsupported type!");
+}
+
+template <typename ComputeTypeC, typename OutType> constexpr bool needs_precision_conversion() {
+  return !std::is_same_v<ComputeTypeC, OutType>;
+}

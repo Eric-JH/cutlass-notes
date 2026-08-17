@@ -5,6 +5,26 @@
 #include <torch/types.h>
 #include "helper.h"
 
+namespace spec{
+using namespace cute;
+
+template <typename T_, int kTileM_ = 16, int kTileN_ = 8, int kTileK_ = 8>
+struct KernelSpec
+{
+  using T = T_;
+
+  static constexpr int kTileM = kTileM_;
+  static constexpr int kTileN = kTileN_;
+  static constexpr int kTileK = kTileK_;
+
+  using MMA_op = SM80_16x8x8_F16F16F16F16_TN;
+  using TiledMMA = decltype(make_tiled_mma(MMA_op{}));
+
+  static constexpr int kThreadNum = size(TiledMMA{});
+  static constexpr int kShmSize = 0;
+};
+}
+
 template<typename Spec, bool IsGemm>
 __global__ void minimal_gemm(void *Cptr, const void *Aptr, const void *Bptr, int m, int n, int k){
     using namespace cute;
@@ -56,30 +76,8 @@ __global__ void minimal_gemm(void *Cptr, const void *Aptr, const void *Bptr, int
     copy(copy_atom, tCrC, tCgC);
 }
 
-namespace spec{
-using namespace cute;
-
-template <typename T_, int kTileM_ = 16, int kTileN_ = 8, int kTileK_ = 8>
-struct KernelSpec
-{
-  using T = T_;
-
-  static constexpr int kTileM = kTileM_;
-  static constexpr int kTileN = kTileN_;
-  static constexpr int kTileK = kTileK_;
-
-  using MMA_op = SM80_16x8x8_F16F16F16F16_TN;
-  using TiledMMA = decltype(make_tiled_mma(MMA_op{}));
-
-  static constexpr int kThreadNum = size(TiledMMA{});
-  static constexpr int kShmSize = 0;
-};
-}
-
-
-
 template <typename ComputeType, typename AccType = ComputeType>
-torch::Tensor minimal_gemm(const torch::Tensor &a, const torch::Tensor &b, std::optional<torch::Tensor> &_c) {
+torch::Tensor run_minimal_gemm(const torch::Tensor &a, const torch::Tensor &b, std::optional<torch::Tensor> &_c) {
   at::cuda::CUDAGuard device_guard{a.get_device()};
   auto stream = at::cuda::getCurrentCUDAStream().stream();
 
@@ -141,5 +139,5 @@ torch::Tensor minimal_gemm(const torch::Tensor &a, const torch::Tensor &b, std::
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-  m.def("minimal_gemm", &(minimal_gemm<cute::half_t>), "Run a single 16x8x8 MMA operation.");
+  m.def("minimal_gemm", &(run_minimal_gemm<cute::half_t>), "Run a single 16x8x8 MMA operation.");
 }
